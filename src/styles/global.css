@@ -170,3 +170,60 @@ sl-textarea::part(textarea) { line-height: 1.65; }
   .workspace { grid-template-columns: 245px minmax(520px, 1fr) 370px; }
   .online-pill { display: none; }
 }
+
+/* 外部机构回执对账 */
+.agency-verdict { margin-top: 8px; border-radius: 7px; padding: 7px 9px; font-size: 10px; display: grid; gap: 2px; }
+.agency-verdict b { font-size: 10px; }
+.agency-verdict span { color: #55625d; line-height: 1.5; }
+.agency-verdict.pass { background: #eef7f1; border: 1px solid #b6dcc7; color: #256a4c; }
+.agency-verdict.fail { background: #fdeeec; border: 1px solid #eebcb6; color: #a33028; }
+.agency-verdict.stale { background: #fff7e8; border: 1px solid #ecd6a3; color: #8a5b12; }
+
+.agency-dialog { display: grid; gap: 16px; }
+.agency-import-card { border: 1px solid #d7ddd9; border-radius: 10px; padding: 13px; background: #fafbf9; }
+.agency-form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 4px; }
+.agency-toolbar { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; margin-top: 4px; }
+.toolbar-spacer { flex: 1; }
+.ingest-result { margin-top: 10px; border-radius: 8px; padding: 8px 10px; font-size: 11px; line-height: 1.6; }
+.ingest-result b { font-weight: 800; }
+.ingest-result.ok { background: #eef7f1; border: 1px solid #b6dcc7; color: #256a4c; }
+.ingest-result.has-failed { background: #fff5e3; border: 1px solid #ecd6a3; color: #8a5b12; }
+
+.batch-section { border-top: 1px dashed #d2d9d5; padding-top: 13px; }
+.section-heading.compact { align-items: end; margin-bottom: 9px; }
+.section-heading.compact h3 { margin: 2px 0 0; font-size: 14px; }
+.section-heading.compact sl-select { width: 230px; margin: 0; }
+.batch-summary { display: flex; flex-wrap: wrap; gap: 12px; font-size: 11px; color: #5b6862; background: #f3f6f4; border-radius: 8px; padding: 8px 11px; margin-bottom: 12px; }
+.batch-summary b { color: #25332e; font-weight: 700; }
+.batch-summary .summary-pass { color: #287a55; font-weight: 800; }
+.batch-summary .summary-fail { color: #b9362d; font-weight: 800; }
+.batch-summary .summary-failed { color: #b76b08; font-weight: 800; }
+
+.receipt-groups { margin-bottom: 12px; }
+.receipt-groups h4 { margin: 10px 0 7px; font-size: 11px; color: #5b6862; }
+.receipt-row { display: grid; grid-template-columns: 64px 1fr; gap: 9px; align-items: center; border: 1px solid #e0e4e2; border-radius: 8px; padding: 8px 10px; margin-bottom: 7px; background: #fff; }
+.receipt-row.pass { border-left: 4px solid #3c9a6b; }
+.receipt-row.fail { border-left: 4px solid #c44b40; }
+.receipt-row.error { grid-template-columns: 1fr; border-color: #eebcb6; border-left: 4px solid #c44b40; background: #fdf7f6; }
+.receipt-error { color: #a33028; font-size: 10px; font-weight: 700; }
+.receipt-row-fields { display: grid; grid-template-columns: 1.2fr .7fr 1.4fr auto; gap: 6px; align-items: center; margin-top: 6px; }
+.receipt-row-fields sl-input { margin: 0; }
+.receipt-verdict { display: inline-block; text-align: center; border-radius: 99px; padding: 3px 8px; font-size: 9px; font-weight: 800; }
+.receipt-verdict.pass { color: #22704e; background: #dcf0e4; }
+.receipt-verdict.fail { color: #a33028; background: #fbe0dd; }
+.receipt-row-copy { min-width: 0; display: grid; gap: 2px; }
+.receipt-row-copy b { font-size: 11px; font-weight: 700; }
+.receipt-row-copy b code { background: #eef1ef; border-radius: 4px; padding: 1px 5px; font-size: 9px; color: #4d5a54; }
+.receipt-row-copy small { color: #6c7872; font-size: 10px; }
+.stale-tag { color: #8a5b12; font-style: normal; font-size: 9px; }
+
+.ledger-table { width: 100%; border-collapse: collapse; font-size: 10px; }
+.ledger-table th { text-align: left; color: #6a7670; font-size: 9px; text-transform: uppercase; letter-spacing: .05em; padding: 5px 7px; border-bottom: 1px solid #d7ddd9; }
+.ledger-table td { padding: 7px; border-bottom: 1px solid #ecf0ee; vertical-align: top; }
+.ledger-table code { background: #eef1ef; border-radius: 4px; padding: 1px 5px; font-size: 9px; color: #4d5a54; }
+.ledger-status { display: inline-block; border-radius: 99px; padding: 2px 8px; font-weight: 700; margin-right: 5px; }
+.ledger-status.pass { color: #22704e; background: #dcf0e4; }
+.ledger-status.fail { color: #a33028; background: #fbe0dd; }
+.ledger-status.pending { color: #8a5b12; background: #fdeed2; }
+.ledger-table small { display: block; color: #8a948e; margin-top: 3px; }
+.no-verdict { color: #94a09a; font-size: 10px; }

@@ -49,6 +49,44 @@ interface VersionSnapshot {
   glossary: GlossaryTerm[];
 }
 
+type AgencyVerdict = "pass" | "fail";
+
+interface DefectReviewRecord {
+  issueKey: string;
+  blockId: string;
+  status: ReviewStatus;
+  via: "self" | "agency";
+  batchId?: string;
+  note?: string;
+  updatedAt: string;
+}
+
+interface ReceiptItem {
+  id: string;
+  issueKey: string;
+  rawIssueKey: string;
+  verdictRaw: string;
+  verdict: AgencyVerdict | "";
+  note: string;
+  matched: boolean;
+  skipped?: boolean;
+  error?: string;
+  blockId?: string;
+  issueTitle?: string;
+  issueType?: AccessibilityIssue["type"];
+  severity?: Severity;
+  reconciledAt?: string;
+}
+
+interface ReviewBatch {
+  id: string;
+  agency: string;
+  round: string;
+  receivedAt: string;
+  importedAt: string;
+  items: ReceiptItem[];
+}
+
 interface ChapterProject {
   id: string;
   title: string;
@@ -57,6 +95,8 @@ interface ChapterProject {
   blocks: ContentBlock[];
   glossary: GlossaryTerm[];
   versions: VersionSnapshot[];
+  defectReviews: DefectReviewRecord[];
+  batches: ReviewBatch[];
   updatedAt: string;
 }
 
@@ -167,6 +207,8 @@ function createSeedProject(): ChapterProject {
       { id: "term-3", source: "下渗", preferred: "渗入地下", note: "避免单独使用专业词" },
     ],
     versions: [],
+    defectReviews: [],
+    batches: [],
     updatedAt: new Date().toISOString(),
   };
 }
@@ -339,6 +381,249 @@ function severityLabel(severity: Severity) {
   return "一致性提醒";
 }
 
+// ---------- 外部机构回执：双份台账、逐条对账与逐行重试 ----------
+
+type ParsedReceiptRow = { issueKey: string; verdictRaw: string; note: string };
+
+function normalizeVerdict(raw: string): AgencyVerdict | "" {
+  const text = raw.trim().toLowerCase();
+  if (!text) return "";
+  if (/^(通过|合格|符合|pass(ed)?|ok|yes|true|1|approved?|accep(t|ted))$/.test(text)) return "pass";
+  if (/^(不通过|不合格|不符合|未通过|fail(ed)?|no|false|0|rejected?|需修改|需要修改|退回)$/.test(text)) return "fail";
+  return "";
+}
+
+function splitCsvLine(line: string): string[] {
+  // 兼容英文逗号、中文逗号与制表符；模板已避免在批注中使用逗号
+  return line.split(/[,，\t]/).map((cell) => cell.trim().replace(/^["']|["']$/g, ""));
+}
+
+function parseReceiptText(input: string): ParsedReceiptRow[] {
+  const lines = input.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith("#"));
+  let keyCol = 0;
+  let verdictCol = 1;
+  let noteCol = 2;
+  let body = lines;
+  if (lines[0] && /缺陷编号|编号|issue\s*key|结论|verdict|result/i.test(lines[0])) {
+    const header = splitCsvLine(lines[0]).map((cell) => cell.toLowerCase());
+    const findCol = (...names: string[]) => header.findIndex((cell) => names.some((name) => cell.includes(name)));
+    const keyIndex = findCol("缺陷编号", "编号", "issue", "key", "id");
+    const verdictIndex = findCol("结论", "判定", "verdict", "result", "pass");
+    const noteIndex = findCol("批注", "说明", "意见", "备注", "note", "comment");
+    if (keyIndex >= 0) keyCol = keyIndex;
+    if (verdictIndex >= 0) verdictCol = verdictIndex;
+    if (noteIndex >= 0) noteCol = noteIndex;
+    body = lines.slice(1);
+  }
+  return body.map((line) => {
+    const cells = splitCsvLine(line);
+    return { issueKey: cells[keyCol] ?? "", verdictRaw: cells[verdictCol] ?? "", note: cells[noteCol] ?? "" };
+  });
+}
+
+function receiptItemFromRow(row: ParsedReceiptRow): ReceiptItem {
+  return {
+    id: uid("receipt"),
+    issueKey: row.issueKey.trim(),
+    rawIssueKey: row.issueKey.trim(),
+    verdictRaw: row.verdictRaw.trim(),
+    verdict: normalizeVerdict(row.verdictRaw),
+    note: row.note.trim(),
+    matched: false,
+  };
+}
+
+// 校验单条回执并与工作台缺陷对上；任何问题都只落在这一行，不影响其他行
+function bindReceiptItem(draft: ChapterProject, item: ReceiptItem): void {
+  item.matched = false;
+  item.error = undefined;
+  if (!item.issueKey) {
+    item.error = "缺少缺陷编号";
+    return;
+  }
+  if (!item.verdict) {
+    item.error = `结论无法识别：“${item.verdictRaw || "（空）"}”，应为 通过 或 不通过`;
+    return;
+  }
+  const issue = analyze(draft).find((candidate) => candidate.id === item.issueKey);
+  if (!issue) {
+    item.error = "工作台没有这个缺陷编号（可能已被改写消除）";
+    return;
+  }
+  if (!draft.blocks.some((block) => block.id === issue.blockId)) {
+    item.error = "对应的内容块已不存在";
+    return;
+  }
+  item.matched = true;
+  item.blockId = issue.blockId;
+  item.issueTitle = issue.title;
+  item.issueType = issue.type;
+  item.severity = issue.severity;
+  item.reconciledAt = new Date().toISOString();
+}
+
+// 工作台台账：以缺陷编号为准记录工作台侧结论，与机构回执各存一份
+function upsertAgencyReview(draft: ChapterProject, item: ReceiptItem, batchId: string) {
+  if (!item.matched || !item.verdict || !item.blockId) return;
+  const now = new Date().toISOString();
+  const status: ReviewStatus = item.verdict === "pass" ? "approved" : "needs-work";
+  const existing = draft.defectReviews.find((record) => record.issueKey === item.issueKey);
+  if (existing) {
+    existing.blockId = item.blockId;
+    existing.status = status;
+    existing.via = "agency";
+    existing.batchId = batchId;
+    existing.note = item.note;
+    existing.updatedAt = now;
+  } else {
+    draft.defectReviews.push({ issueKey: item.issueKey, blockId: item.blockId, status, via: "agency", batchId, note: item.note, updatedAt: now });
+  }
+}
+
+// 整块只有在其当前缺陷全部通过时才转已通过；任一不通过即退回重做；其余保持原状态
+function recomputeBlockStatus(draft: ChapterProject, blockId: string) {
+  const block = draft.blocks.find((item) => item.id === blockId);
+  if (!block) return;
+  const current = analyze(draft).filter((issue) => issue.blockId === blockId);
+  if (!current.length) return;
+  const records = current.map((issue) => draft.defectReviews.find((record) => record.issueKey === issue.id));
+  if (records.some((record) => record?.status === "needs-work")) {
+    block.reviewStatus = "needs-work";
+    return;
+  }
+  if (records.every((record) => record?.status === "approved")) {
+    block.reviewStatus = "approved";
+  }
+  // 本轮机构没提异议、或仍有待复核条目的，保留工作台当前状态
+}
+
+interface IngestResult {
+  matched: number;
+  failed: number;
+  skipped: number;
+}
+
+function ingestReceiptRows(draft: ChapterProject, batch: ReviewBatch, rows: ParsedReceiptRow[], skipKeys: Set<string>): IngestResult {
+  let matched = 0;
+  let failed = 0;
+  let skipped = 0;
+  for (const row of rows) {
+    const key = row.issueKey.trim();
+    if (key && skipKeys.has(key)) {
+      skipped++;
+      continue;
+    }
+    const item = receiptItemFromRow(row);
+    bindReceiptItem(draft, item);
+    batch.items.push(item);
+    if (item.matched) {
+      upsertAgencyReview(draft, item, batch.id);
+      recomputeBlockStatus(draft, item.blockId!);
+      matched++;
+    } else {
+      failed++;
+    }
+  }
+  return { matched, failed, skipped };
+}
+
+// 弹窗内逐行重试：只重新校验并重对这一条
+function retryReceiptItem(draft: ChapterProject, batch: ReviewBatch, item: ReceiptItem) {
+  item.issueKey = item.issueKey.trim();
+  item.verdict = normalizeVerdict(item.verdictRaw);
+  bindReceiptItem(draft, item);
+  if (item.matched) {
+    upsertAgencyReview(draft, item, batch.id);
+    recomputeBlockStatus(draft, item.blockId!);
+  }
+}
+
+function syncBlockSelfReview(draft: ChapterProject, blockId: string, status: ReviewStatus) {
+  const block = draft.blocks.find((item) => item.id === blockId);
+  if (!block) return;
+  block.reviewStatus = status;
+  const currentKeys = analyze(draft).filter((issue) => issue.blockId === blockId).map((issue) => issue.id);
+  const now = new Date().toISOString();
+  for (const key of currentKeys) {
+    const existing = draft.defectReviews.find((record) => record.issueKey === key);
+    if (existing) {
+      existing.status = status;
+      existing.via = "self";
+      existing.updatedAt = now;
+    } else {
+      draft.defectReviews.push({ issueKey: key, blockId, status, via: "self", updatedAt: now });
+    }
+  }
+}
+
+// 编辑改写内容后，该块当前缺陷回到待复核；机构批注等历史信息保留
+function resetBlockDefectReviews(draft: ChapterProject, blockId: string) {
+  const activeKeys = new Set(analyze(draft).filter((issue) => issue.blockId === blockId).map((issue) => issue.id));
+  const now = new Date().toISOString();
+  for (const record of draft.defectReviews) {
+    if (record.blockId === blockId && activeKeys.has(record.issueKey) && record.status !== "pending") {
+      record.status = "pending";
+      record.via = "self";
+      record.updatedAt = now;
+    }
+  }
+}
+
+function batchStats(batch: ReviewBatch) {
+  const matched = batch.items.filter((item) => item.matched);
+  return {
+    total: batch.items.length,
+    matched: matched.length,
+    failed: batch.items.length - matched.length,
+    pass: matched.filter((item) => item.verdict === "pass").length,
+    fail: matched.filter((item) => item.verdict === "fail").length,
+  };
+}
+
+function csvCell(value: string) {
+  return /[",\n]/.test(value) ? `"${value.replaceAll('"', '""')}"` : value;
+}
+
+function buildReceiptTemplate(project: ChapterProject): string {
+  const header = ["缺陷编号", "位置", "缺陷", "复核结论(通过/不通过)", "机构批注"].join(",");
+  const rows = analyze(project).map((issue) => {
+    const blockIndex = project.blocks.findIndex((block) => block.id === issue.blockId) + 1;
+    return [issue.id, `第${blockIndex}块`, issue.title, "", issue.suggestion].map(csvCell).join(",");
+  });
+  return [header, ...rows].join("\n");
+}
+
+// 示例回执：故意混入坏行，演示逐行失败与重试
+function buildSampleReceipt(project: ChapterProject): string {
+  const list = analyze(project);
+  const lines: string[] = [];
+  const image = list.find((issue) => issue.type === "image");
+  if (image) lines.push(`${image.id},不通过,替代文本只写了图号，需要读出图中的水循环环节`);
+  // 找一个“该块唯一缺陷”的长句：机构判通过后整块即可转为已通过
+  const counts = new Map<string, number>();
+  for (const issue of list) counts.set(issue.blockId, (counts.get(issue.blockId) ?? 0) + 1);
+  const loneSentence = list.find((issue) => issue.type === "sentence" && counts.get(issue.blockId) === 1);
+  if (loneSentence) lines.push(`${loneSentence.id},通过,短句拆分清楚，步骤顺序明确`);
+  const glossary = list.find((issue) => issue.type === "glossary" && issue.blockId !== loneSentence?.blockId);
+  if (glossary) lines.push(`${glossary.id},通过,该条术语表述可以接受，但同块还有其他条目待核`);
+  lines.push("term-block-p9-term-9,通过,这个编号工作台不存在（演示逐行报错）");
+  lines.push("image-block-x,同意,结论应写通过或不通过（演示无法识别）");
+  return lines.join("\n");
+}
+
+function agencyBadgeHtml(project: ChapterProject, record: DefectReviewRecord | undefined): string {
+  if (!record?.batchId) return "";
+  const batch = project.batches.find((item) => item.id === record.batchId);
+  const round = batch?.round ? `（${batch.round}）` : "";
+  if (record.status === "approved") {
+    return `<div class="agency-verdict pass"><b>机构最近判定${round}：通过</b>${record.note ? `<span>${escapeHtml(record.note)}</span>` : ""}</div>`;
+  }
+  if (record.status === "needs-work") {
+    return `<div class="agency-verdict fail"><b>机构最近判定${round}：不通过 · 已退回工作台重做</b>${record.note ? `<span>${escapeHtml(record.note)}</span>` : ""}</div>`;
+  }
+  return `<div class="agency-verdict stale"><b>内容已修改，原机构结论待重新复核</b>${record.note ? `<span>${escapeHtml(record.note)}</span>` : ""}</div>`;
+}
+
 function exportHtml(project: ChapterProject) {
   const body = project.blocks.map((block) => {
     if (block.type === "heading") {
@@ -353,6 +638,7 @@ function exportHtml(project: ChapterProject) {
     }
     return `<p>${escapeHtml(block.accessibleText || block.text)}</p>`;
   }).join("\n      ");
+  const report = exportReviewReport(project);
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -367,15 +653,56 @@ function exportHtml(project: ChapterProject) {
     h1, h2, h3, h4, h5, h6 { line-height: 1.4; margin-top: 1.8em; }
     figure { margin: 2em 0; } img { max-width: 100%; height: auto; } figcaption { font-size: .86em; color: #46554f; }
     .skip { position: absolute; left: -9999px; } .skip:focus { position: static; display: inline-block; padding: .5em; background: #fff; }
+    .external-review { margin-top: 3em; border-top: 3px solid #1f4a3e; padding-top: 1.2em; }
+    .external-review h2 { margin-top: .4em; }
+    .external-review .review-meta { color: #46554f; font-size: .9em; }
+    .external-review ul { list-style: none; padding: 0; margin: 1em 0 0; display: grid; gap: .8em; }
+    .external-review li { border: 1px solid #d7ddd9; border-left-width: 5px; border-radius: 8px; padding: .6em .9em; }
+    .external-review li.pass { border-left-color: #287a55; background: #f3faf6; }
+    .external-review li.fail { border-left-color: #b9362d; background: #fdf6f5; }
+    .external-review li .verdict { font-weight: 700; margin-right: .6em; }
+    .external-review li.pass .verdict { color: #287a55; }
+    .external-review li.fail .verdict { color: #b9362d; }
+    .external-review li p { margin: .3em 0 0; font-size: .92em; color: #31433d; }
+    .external-review li .agency-note { color: #5a6862; }
   </style>
 </head>
 <body>
   <a class="skip" href="#main">跳到正文</a>
   <main id="main" tabindex="-1">
       ${body}
+      ${report}
   </main>
 </body>
 </html>`;
+}
+
+// 导出的无障碍版本附上最近一批外部机构复核结论（逐条、读屏可理解）
+function exportReviewReport(project: ChapterProject): string {
+  const batch = project.batches[0];
+  if (!batch) return "";
+  const matched = batch.items
+    .filter((item) => item.matched && item.verdict)
+    .sort((a, b) => {
+      const ia = project.blocks.findIndex((block) => block.id === a.blockId);
+      const ib = project.blocks.findIndex((block) => block.id === b.blockId);
+      return ia - ib || a.issueKey.localeCompare(b.issueKey);
+    });
+  const items = matched.map((item) => {
+    const blockIndex = project.blocks.findIndex((block) => block.id === item.blockId) + 1;
+    const location = blockIndex > 0 ? `第 ${blockIndex} 块 · ` : "";
+    const title = item.issueTitle ?? item.issueKey;
+    const verdict = item.verdict === "pass" ? "通过" : "不通过（退回工作台重做）";
+    const note = item.note ? `<p class="agency-note">机构批注：${escapeHtml(item.note)}</p>` : "";
+    return `<li class="${item.verdict}"><span class="verdict">${verdict}</span><strong>${escapeHtml(location + title)}</strong>${note}</li>`;
+  }).join("\n        ");
+  return `<section class="external-review" aria-labelledby="review-report-title">
+    <h2 id="review-report-title">外部无障碍机构复核结论</h2>
+    <p class="review-meta">复核机构：${escapeHtml(batch.agency)} ｜ 复核轮次：${escapeHtml(batch.round)} ｜ 回执日期：${escapeHtml(new Date(batch.receivedAt).toLocaleDateString())} ｜ 已对账 ${matched.length} 条（通过 ${batchStats(batch).pass} 条，不通过 ${batchStats(batch).fail} 条）</p>
+    <ul>
+        ${items}
+    </ul>
+  </section>`;
 }
 
 function download(filename: string, content: string, type = "text/html;charset=utf-8") {
@@ -391,7 +718,12 @@ function download(filename: string, content: string, type = "text/html;charset=u
 function loadProject(): ChapterProject {
   try {
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: ChapterProject };
-    if (stored.schema === 1 && stored.project?.blocks?.length) return stored.project;
+    if ([1, 2].includes(stored.schema) && stored.project?.blocks?.length) {
+      const migrated = stored.project;
+      migrated.defectReviews ??= [];
+      migrated.batches ??= [];
+      return migrated;
+    }
   } catch {
     // Fall back to the bundled sample.
   }
@@ -408,6 +740,12 @@ let activeIssueId = "";
 let previewMode: "normal" | "assisted" = "normal";
 let selectedVersionId = "";
 let showGlossary = false;
+let showAgency = false;
+let agencyDraft = "";
+let receiptAgencyName = "外部无障碍审校机构";
+let receiptRound = "";
+let selectedBatchId = "";
+let lastIngestResult: IngestResult | null = null;
 let undoStack: ChapterProject[] = [];
 let redoStack: ChapterProject[] = [];
 let saveTimer = 0;
@@ -418,7 +756,7 @@ const issues = () => analyze(project);
 function saveSoon() {
   window.clearTimeout(saveTimer);
   saveTimer = window.setTimeout(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 1, project }));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 2, project }));
   }, 320);
 }
 
@@ -480,6 +818,7 @@ function render() {
           <sl-button size="small" variant="default" ${undoStack.length ? "" : "disabled"} data-action="undo">撤销</sl-button>
           <sl-button size="small" variant="default" ${redoStack.length ? "" : "disabled"} data-action="redo">重做</sl-button>
           <sl-button size="small" variant="default" data-action="glossary">术语表</sl-button>
+          <sl-button size="small" variant="warning" outline data-action="agency-dialog">机构回执对账${project.batches[0] ? ` · ${project.batches.length}` : ""}${project.batches[0] && batchStats(project.batches[0]).failed ? ` · ${batchStats(project.batches[0]).failed} 待重试` : ""}</sl-button>
           <sl-button size="small" variant="primary" data-action="save-version">保存版本</sl-button>
           <sl-button size="small" variant="success" data-action="export">导出无障碍 HTML</sl-button>
         </div>
@@ -523,11 +862,15 @@ function render() {
             </div>
           </div>
 
-          ${activeIssues.length ? `<div class="active-issues">${activeIssues.map((issue) => `
+          ${activeIssues.length ? `<div class="active-issues">${activeIssues.map((issue) => {
+            const record = project.defectReviews.find((item) => item.issueKey === issue.id);
+            return `
             <div class="issue-card ${issue.severity}">
               <div><sl-badge variant="${issue.severity === "error" ? "danger" : issue.severity === "warning" ? "warning" : "primary"}">${severityLabel(issue.severity)}</sl-badge><strong>${escapeHtml(issue.title)}</strong></div>
               <p>${escapeHtml(issue.detail)}</p><small>${escapeHtml(issue.suggestion)}</small>
-            </div>`).join("")}</div>` : `<div class="issue-clear">✓ 当前内容块没有新的无障碍问题</div>`}
+              ${agencyBadgeHtml(project, record)}
+            </div>`;
+          }).join("")}</div>` : `<div class="issue-clear">✓ 当前内容块没有新的无障碍问题</div>`}
 
           <section class="edit-card source-card">
             <div class="section-heading"><div><span class="eyebrow">原教材</span><h2>${active.type === "image" ? "图片信息" : active.type === "link" ? "链接信息" : "原文"}</h2></div><sl-badge variant="neutral">${active.type}</sl-badge></div>
@@ -589,7 +932,7 @@ function render() {
         </aside>
       </div>
 
-      <footer class="statusbar"><span>最近操作：${escapeHtml(document.documentElement.dataset.lastAction || "示例章节已载入")}</span><span>${project.blocks.length} 个内容块 · ${list.length} 个待处理问题</span></footer>
+      <footer class="statusbar"><span>最近操作：${escapeHtml(document.documentElement.dataset.lastAction || "示例章节已载入")}</span><span>${project.blocks.length} 个内容块 · ${list.length} 个待处理问题${project.batches[0] ? ` · 机构回执 ${project.batches.length} 批（最新一批通过 ${batchStats(project.batches[0]).pass} / 不通过 ${batchStats(project.batches[0]).fail} / 待重试 ${batchStats(project.batches[0]).failed}）` : ""}</span></footer>
     </div>
 
     <sl-dialog label="全书术语表" ${showGlossary ? "open" : ""} data-dialog="glossary">
@@ -598,7 +941,8 @@ function render() {
       </div>
       <div class="term-add"><sl-input id="new-term-source" placeholder="原文术语"></sl-input><sl-input id="new-term-preferred" placeholder="统一表达"></sl-input><sl-button variant="primary" data-action="add-term">添加术语</sl-button></div>
       <sl-button slot="footer" variant="primary" data-action="close-glossary">完成</sl-button>
-    </sl-dialog>`;
+    </sl-dialog>
+    ${renderAgencyDialog()}`;
 
   wireLiveFields();
 }
@@ -648,12 +992,121 @@ function renderVersionDiff(version: VersionSnapshot, current: ContentBlock) {
   return `<div class="diff-column"><span>旧版</span><p>${escapeHtml(oldBlock.accessibleText || oldBlock.text)}</p></div><div class="diff-column current"><span>当前</span><p>${escapeHtml(current.accessibleText || current.text)}</p></div>`;
 }
 
+function reviewLedgerStatusLabel(status: ReviewStatus) {
+  if (status === "approved") return "已通过";
+  if (status === "needs-work") return "退回重做";
+  return "待复核";
+}
+
+function renderAgencyDialog(): string {
+  if (!showAgency) return "";
+  const batches = project.batches;
+  const batch = batches.find((item) => item.id === selectedBatchId) ?? batches[0];
+  const failedItems = batch ? batch.items.filter((item) => !item.matched) : [];
+  const matchedItems = batch ? batch.items.filter((item) => item.matched) : [];
+  const currentIssueKeys = new Set(issues().map((issue) => issue.id));
+
+  const failedRows = failedItems.map((item) => `
+    <div class="receipt-row error" data-item-id="${item.id}">
+      <div class="receipt-error">${escapeHtml(item.error ?? "未知错误")}</div>
+      <div class="receipt-row-fields">
+        <sl-input size="small" data-receipt-item-field="issueKey" data-item-id="${item.id}" value="${escapeHtml(item.issueKey)}" placeholder="缺陷编号"></sl-input>
+        <sl-input size="small" data-receipt-item-field="verdictRaw" data-item-id="${item.id}" value="${escapeHtml(item.verdictRaw)}" placeholder="通过 / 不通过"></sl-input>
+        <sl-input size="small" data-receipt-item-field="note" data-item-id="${item.id}" value="${escapeHtml(item.note)}" placeholder="机构批注（可留空）"></sl-input>
+        <sl-button size="small" variant="primary" data-action="retry-item" data-item-id="${item.id}" data-batch-id="${batch?.id ?? ""}">重试本条</sl-button>
+      </div>
+    </div>`).join("");
+
+  const matchedRows = matchedItems.map((item) => {
+    const stale = !currentIssueKeys.has(item.issueKey);
+    return `<div class="receipt-row ${item.verdict}">
+      <span class="receipt-verdict ${item.verdict}">${item.verdict === "pass" ? "通过" : "不通过"}</span>
+      <div class="receipt-row-copy"><b>${escapeHtml(item.issueTitle ?? item.issueKey)} <code>${escapeHtml(item.issueKey)}</code></b>${stale ? `<em class="stale-tag">缺陷已消除</em>` : ""}${item.note ? `<small>${escapeHtml(item.note)}</small>` : ""}</div>
+    </div>`;
+  }).join("");
+
+  const ledgerRows = (() => {
+    const list = issues();
+    if (!list.length) return `<div class="empty-note">当前没有需要对账的缺陷。</div>`;
+    return `<table class="ledger-table"><thead><tr><th>缺陷编号</th><th>位置 / 缺陷</th><th>工作台台账</th><th>最新机构结论</th></tr></thead><tbody>${list.map((issue) => {
+      const blockIndex = project.blocks.findIndex((block) => block.id === issue.blockId) + 1;
+      const record = project.defectReviews.find((item) => item.issueKey === issue.id);
+      const agencyItem = batches[0]?.items.find((item) => item.matched && item.issueKey === issue.id);
+      const selfStatus = reviewLedgerStatusLabel(record?.status ?? "pending");
+      const selfClass = !record ? "pending" : record.status === "approved" ? "pass" : record.status === "needs-work" ? "fail" : "pending";
+      const agency = agencyItem
+        ? `<span class="receipt-verdict ${agencyItem.verdict}">${agencyItem.verdict === "pass" ? "通过" : "不通过"}</span><small>${escapeHtml(batches[0].round || "最新一批")}</small>`
+        : `<span class="no-verdict">本轮未提及</span>`;
+      return `<tr><td><code>${escapeHtml(issue.id)}</code></td><td>第 ${blockIndex} 块 · ${escapeHtml(issue.title)}</td><td><span class="ledger-status ${selfClass}">${selfStatus}</span><small>${record?.via === "agency" ? "跟随机构对账" : "工作台自评"}</small></td><td>${agency}</td></tr>`;
+    }).join("")}</tbody></table>`;
+  })();
+
+  const resultBanner = lastIngestResult
+    ? `<div class="ingest-result ${lastIngestResult.failed ? "has-failed" : "ok"}">本轮对账完成：对上 <b>${lastIngestResult.matched}</b> 条，<b>${lastIngestResult.failed}</b> 条待重试${lastIngestResult.skipped ? `，<b>${lastIngestResult.skipped}</b> 条此前已对上、已跳过` : ""}。</div>`
+    : "";
+
+  return `
+  <input id="receipt-file" type="file" accept=".txt,.md,.markdown,.csv,text/csv,text/plain" hidden />
+  <sl-dialog label="外部机构回执 · 按缺陷条目对账" open data-dialog="agency" style="--width:780px;">
+    <div class="agency-dialog">
+      <div class="agency-import-card">
+        <div class="agency-form-row">
+          <sl-input id="receipt-agency" size="small" label="复核机构" data-receipt-field="agency" value="${escapeHtml(receiptAgencyName)}"></sl-input>
+          <sl-input id="receipt-round" size="small" label="复核轮次" data-receipt-field="round" value="${escapeHtml(receiptRound)}" placeholder="如：第 2 轮"></sl-input>
+        </div>
+        <sl-textarea id="receipt-text" rows="7" label="机构回执（每行：缺陷编号,通过/不通过,批注；可粘贴或选择回执文件）" value="${escapeHtml(agencyDraft)}" placeholder="image-block-img,不通过,替代文本需要描述图中的环节&#10;sentence-block-p1-0,通过,短句拆分清楚"></sl-textarea>
+        <div class="agency-toolbar">
+          <sl-button size="small" data-action="receipt-file">选择回执文件…</sl-button>
+          <sl-button size="small" data-action="sample-receipt">填入示例回执</sl-button>
+          <sl-button size="small" data-action="download-template">下载空白回执模板</sl-button>
+          <span class="toolbar-spacer"></span>
+          <sl-button size="small" variant="primary" data-action="import-new-batch">导入并对账（新一批）</sl-button>
+          ${batch && batchStats(batch).failed ? `<sl-button size="small" variant="warning" outline data-action="retry-batch" data-batch-id="${batch.id}">补传文件：只补该批未对上的 ${batchStats(batch).failed} 条</sl-button>` : ""}
+        </div>
+        ${resultBanner}
+      </div>
+
+      ${batches.length ? `
+      <section class="batch-section">
+        <div class="section-heading compact">
+          <div><span class="eyebrow">Agency copies</span><h3>机构回执存档（机构那份，逐条原样保留）</h3></div>
+          <sl-select id="batch-select" size="small" value="${batch?.id ?? ""}">${batches.map((item) => `<sl-option value="${item.id}">${escapeHtml(item.agency)} · ${escapeHtml(item.round || `批次 ${batches.indexOf(item) + 1}`)}</sl-option>`).join("")}</sl-select>
+        </div>
+        ${batch ? `<div class="batch-summary">
+          <span>机构：<b>${escapeHtml(batch.agency)}</b></span>
+          <span>轮次：<b>${escapeHtml(batch.round || "未填写")}</b></span>
+          <span>回执日期：<b>${new Date(batch.receivedAt).toLocaleDateString()}</b></span>
+          <span class="summary-pass">通过 ${batchStats(batch).pass}</span>
+          <span class="summary-fail">不通过 ${batchStats(batch).fail}</span>
+          <span class="summary-failed">待重试 ${batchStats(batch).failed}</span>
+        </div>` : ""}
+
+        ${failedItems.length ? `<div class="receipt-groups"><h4>导入失败的条目（可逐条修改后重试）</h4>${failedRows}</div>` : ""}
+        ${matchedItems.length ? `<div class="receipt-groups"><h4>已对账条目（机构结论不随工作台操作改变）</h4>${matchedRows}</div>` : `<div class="empty-note">还没有对上任何条目。</div>`}
+      </section>
+
+      <section class="batch-section">
+        <div class="section-heading compact"><div><span class="eyebrow">Workbench ledger</span><h3>工作台缺陷台账（工作台这份）</h3></div></div>
+        ${ledgerRows}
+      </section>` : `<div class="empty-note">还没有导入过机构回执。粘贴或选择回执文件后导入即可按条目对账。</div>`}
+    </div>
+    <sl-button slot="footer" variant="primary" data-action="close-agency">完成</sl-button>
+  </sl-dialog>`;
+}
+
 function wireLiveFields() {
   app.querySelectorAll<HTMLElement>("sl-input[data-field], sl-textarea[data-field], sl-select[data-field]").forEach((element) => {
     element.addEventListener("sl-input", () => {
       const value = (element as HTMLElement & { value: string }).value;
-      updateActiveBlock((block) => {
-        const field = element.dataset.field;
+      const field = element.dataset.field;
+      // 改写原因、批注属于编辑记录，不跟着机构结论走，也不触发重新复核
+      if (field === "reason") {
+        updateActiveBlock((block) => {
+          block.changeReason = value;
+        }, "编辑改写原因", false);
+        return;
+      }
+      updateActiveBlock((block, draft) => {
         if (field === "source") block.text = value;
         if (field === "accessible") {
           block.accessibleText = value;
@@ -664,8 +1117,8 @@ function wireLiveFields() {
           block.accessibleText = value;
         }
         if (field === "link-href") block.linkHref = value;
-        if (field === "reason") block.changeReason = value;
         block.reviewStatus = "pending";
+        resetBlockDefectReviews(draft, block.id);
       }, "编辑无障碍文本", false);
     });
     element.addEventListener("sl-change", () => render());
@@ -694,15 +1147,22 @@ app.addEventListener("click", (event) => {
     const suggestion = block.type === "link"
       ? "打开水循环互动实验"
       : simplifyText(block.type === "image" ? block.imageAlt || block.text : block.text, project.glossary);
-    updateActiveBlock((current) => {
+    updateActiveBlock((current, draft) => {
       if (current.type === "image") current.imageAlt = suggestion;
       current.accessibleText = suggestion;
       current.changeReason ||= "拆分长句并替换复杂表达，保留原有知识信息。";
       current.reviewStatus = "pending";
+      resetBlockDefectReviews(draft, current.id);
     }, "生成易读版本");
   }
-  if (action === "approve") updateActiveBlock((block) => { block.reviewStatus = "approved"; }, "审核通过");
-  if (action === "needs-work") updateActiveBlock((block) => { block.reviewStatus = "needs-work"; }, "标记需修改");
+  if (action === "approve") commit("审核通过", (draft) => {
+    const blockId = activeBlockId;
+    syncBlockSelfReview(draft, blockId, "approved");
+  });
+  if (action === "needs-work") commit("标记需修改", (draft) => {
+    const blockId = activeBlockId;
+    syncBlockSelfReview(draft, blockId, "needs-work");
+  });
   if (action === "add-comment") {
     const input = app.querySelector<HTMLElement & { value: string }>("#new-comment");
     const body = input?.value.trim();
@@ -729,6 +1189,80 @@ app.addEventListener("click", (event) => {
   if (action === "preview-assisted") { previewMode = "assisted"; render(); }
   if (action === "glossary") { showGlossary = true; render(); }
   if (action === "close-glossary") { showGlossary = false; render(); }
+  if (action === "agency-dialog") {
+    showAgency = true;
+    selectedBatchId = project.batches[0]?.id ?? "";
+    lastIngestResult = null;
+    render();
+  }
+  if (action === "close-agency") { showAgency = false; render(); }
+  if (action === "download-template") {
+    download(`${project.title}-机构回执模板.csv`, `﻿${buildReceiptTemplate(project)}`, "text/csv;charset=utf-8");
+    document.documentElement.dataset.lastAction = "已下载机构回执模板（CSV）";
+  }
+  if (action === "sample-receipt") {
+    agencyDraft = buildSampleReceipt(project);
+    render();
+  }
+  if (action === "receipt-file") app.querySelector<HTMLInputElement>("#receipt-file")?.click();
+  if (action === "import-new-batch" || action === "retry-batch") {
+    const text = (app.querySelector<HTMLElement & { value: string }>("#receipt-text")?.value ?? agencyDraft).trim();
+    if (!text) {
+      lastIngestResult = null;
+      document.documentElement.dataset.lastAction = "回执内容为空，未导入任何条目";
+      render();
+      return;
+    }
+    const rows = parseReceiptText(text);
+    if (action === "import-new-batch") {
+      const batchId = uid("batch");
+      const round = (app.querySelector<HTMLElement & { value: string }>("#receipt-round")?.value ?? receiptRound).trim();
+      const agency = (app.querySelector<HTMLElement & { value: string }>("#receipt-agency")?.value ?? receiptAgencyName).trim() || "外部机构";
+      commit("导入机构回执并按条目对账", (draft) => {
+        const batch: ReviewBatch = {
+          id: batchId,
+          agency,
+          round: round || `第 ${draft.batches.length + 1} 轮`,
+          receivedAt: new Date().toISOString(),
+          importedAt: new Date().toISOString(),
+          items: [],
+        };
+        lastIngestResult = ingestReceiptRows(draft, batch, rows, new Set());
+        draft.batches.unshift(batch);
+      });
+      selectedBatchId = batchId;
+      receiptRound = "";
+    } else {
+      const batchId = target.dataset.batchId ?? selectedBatchId;
+      commit("补传回执，只补未对上的条目", (draft) => {
+        const draftBatch = draft.batches.find((item) => item.id === batchId);
+        if (!draftBatch) return;
+        const matchedKeys = new Set(draftBatch.items.filter((item) => item.matched).map((item) => item.issueKey));
+        // 丢掉之前的坏行，等待新回执重新对；已对上的行原样保留
+        draftBatch.items = draftBatch.items.filter((item) => item.matched);
+        lastIngestResult = ingestReceiptRows(draft, draftBatch, rows, matchedKeys);
+      });
+      selectedBatchId = batchId;
+    }
+    agencyDraft = "";
+    render();
+  }
+  if (action === "retry-item") {
+    const batchId = target.dataset.batchId ?? selectedBatchId;
+    const itemId = target.dataset.itemId ?? "";
+    const row = target.closest<HTMLElement>(".receipt-row");
+    const read = (field: string) => row?.querySelector<HTMLElement & { value: string }>(`[data-receipt-item-field="${field}"]`)?.value ?? "";
+    commit("逐条重试机构回执", (draft) => {
+      const draftBatch = draft.batches.find((item) => item.id === batchId);
+      const item = draftBatch?.items.find((entry) => entry.id === itemId);
+      if (!draftBatch || !item) return;
+      item.issueKey = read("issueKey");
+      item.verdictRaw = read("verdictRaw");
+      item.note = read("note");
+      retryReceiptItem(draft, draftBatch, item);
+      lastIngestResult = null;
+    });
+  }
   if (action === "add-term") {
     const source = app.querySelector<HTMLElement & { value: string }>("#new-term-source");
     const preferred = app.querySelector<HTMLElement & { value: string }>("#new-term-preferred");
@@ -750,7 +1284,7 @@ app.addEventListener("click", (event) => {
     render();
   }
   if (action === "approve-all") {
-    commit("全部审核通过", (draft) => { draft.blocks.forEach((block) => { block.reviewStatus = "approved"; }); });
+    commit("全部审核通过", (draft) => { draft.blocks.forEach((block) => { syncBlockSelfReview(draft, block.id, "approved"); }); });
   }
   if (action === "export") {
     download(`${project.title}-无障碍版.html`, exportHtml(project));
@@ -765,7 +1299,43 @@ app.addEventListener("sl-change", (event) => {
   if (element.id === "chapter-file") return;
   if (element.id.startsWith("heading-level-")) {
     const level = Number((element as HTMLElement & { value: string }).value);
-    updateActiveBlock((block) => { block.headingLevel = level; block.reviewStatus = "pending"; }, "修改标题层级");
+    updateActiveBlock((block, draft) => {
+      block.headingLevel = level;
+      block.reviewStatus = "pending";
+      resetBlockDefectReviews(draft, block.id);
+    }, "修改标题层级");
+  }
+  if (element.id === "batch-select") {
+    // 切批次前先留住文本框里尚未导入的回执
+    const text = app.querySelector<HTMLElement & { value: string }>("#receipt-text");
+    if (text) agencyDraft = text.value;
+    selectedBatchId = (element as HTMLElement & { value: string }).value;
+    lastIngestResult = null;
+    render();
+  }
+  // 弹窗内逐行重试所用的输入，仅即时同步到 DOM 行内（真正提交发生在“重试本条”）
+  if (element.matches("[data-receipt-item-field]")) {
+    const itemId = (element as HTMLElement).dataset.itemId;
+    const field = (element as HTMLElement).dataset.receiptItemField;
+    const value = (element as HTMLElement & { value: string }).value;
+    const item = project.batches.flatMap((batch) => batch.items).find((entry) => entry.id === itemId);
+    if (item && field) {
+      if (field === "issueKey") item.issueKey = value;
+      if (field === "verdictRaw") item.verdictRaw = value;
+      if (field === "note") item.note = value;
+    }
+    return;
+  }
+  // 机构/轮次输入即时更新，不触发渲染以免打断输入
+  if (element.matches("[data-receipt-field]")) {
+    const field = (element as HTMLElement).dataset.receiptField;
+    const value = (element as HTMLElement & { value: string }).value;
+    if (field === "agency") receiptAgencyName = value;
+    if (field === "round") receiptRound = value;
+    return;
+  }
+  if (element.id === "receipt-text") {
+    agencyDraft = (element as HTMLElement & { value: string }).value;
   }
   if (element.id === "version-select") {
     selectedVersionId = (element as HTMLElement & { value: string }).value;
@@ -780,10 +1350,23 @@ app.addEventListener("sl-change", (event) => {
 
 app.addEventListener("change", (event) => {
   const input = event.target as HTMLInputElement;
+  if (input.id === "receipt-file" && input.files?.[0]) {
+    void input.files[0].text().then((text) => {
+      agencyDraft = text.replace(/^﻿/, "");
+      input.value = "";
+      render();
+    });
+    return;
+  }
   if (input.id !== "chapter-file" || !input.files?.[0]) return;
   void input.files[0].text().then((text) => {
     commit("导入章节文本", (draft) => {
       draft.blocks = parseImportedChapter(text);
+      // 新章节的缺陷编号与旧回执不再对应，台账与回执批次一并清空
+      draft.defectReviews = [];
+      draft.batches = [];
+      selectedBatchId = "";
+      lastIngestResult = null;
       activeBlockId = draft.blocks[0]?.id ?? "";
       activeIssueId = "";
     });
@@ -800,6 +1383,19 @@ app.addEventListener("input", (event) => {
 
 window.addEventListener("online", render);
 window.addEventListener("offline", render);
+app.addEventListener("sl-request-close", (event) => {
+  const dialog = (event.target as HTMLElement).closest<HTMLElement>("[data-dialog]");
+  if (dialog?.dataset.dialog === "agency") {
+    event.preventDefault();
+    showAgency = false;
+    render();
+  }
+  if (dialog?.dataset.dialog === "glossary") {
+    event.preventDefault();
+    showGlossary = false;
+    render();
+  }
+});
 window.addEventListener("keydown", (event) => {
   const target = event.target as HTMLElement;
   if (target.matches("input, textarea, sl-input, sl-textarea, [contenteditable='true']")) return;
