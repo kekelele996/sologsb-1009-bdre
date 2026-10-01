@@ -3,6 +3,7 @@ import "@shoelace-style/shoelace/dist/shoelace.js";
 type BlockType = "heading" | "paragraph" | "image" | "link";
 type ReviewStatus = "pending" | "approved" | "needs-work";
 type Severity = "error" | "warning" | "info";
+type OrgVerdict = "pass" | "fail" | "none";
 
 interface CommentReply {
   id: string;
@@ -32,6 +33,27 @@ interface ContentBlock {
   changeReason: string;
   reviewStatus: ReviewStatus;
   comments: CommentItem[];
+  orgVerdict?: OrgVerdict;
+  orgNote?: string;
+  orgRound?: number;
+}
+
+interface ReceiptItem {
+  blockId: string;
+  verdict: OrgVerdict;
+  note: string;
+  matched: boolean;
+  protected: boolean;
+  error: string;
+  attempts: number;
+}
+
+interface ReviewReceipt {
+  schema: string;
+  round: number;
+  reviewedAt: string;
+  importedAt: string;
+  items: ReceiptItem[];
 }
 
 interface GlossaryTerm {
@@ -57,6 +79,7 @@ interface ChapterProject {
   blocks: ContentBlock[];
   glossary: GlossaryTerm[];
   versions: VersionSnapshot[];
+  reviewReceipt: ReviewReceipt | null;
   updatedAt: string;
 }
 
@@ -71,6 +94,7 @@ interface AccessibilityIssue {
 }
 
 const STORAGE_KEY = "sologsb-1009-accessible-textbook-v1";
+const RECEIPT_SCHEMA = "accessibility-review-receipt-v1";
 const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 
 function createSeedProject(): ChapterProject {
@@ -167,6 +191,7 @@ function createSeedProject(): ChapterProject {
       { id: "term-3", source: "下渗", preferred: "渗入地下", note: "避免单独使用专业词" },
     ],
     versions: [],
+    reviewReceipt: null,
     updatedAt: new Date().toISOString(),
   };
 }
@@ -178,6 +203,200 @@ function escapeHtml(value: string) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+function verdictLabel(verdict: OrgVerdict | undefined | null) {
+  if (verdict === "pass") return "机构通过";
+  if (verdict === "fail") return "机构不通过";
+  if (verdict === "none") return "无异议";
+  return "未送审";
+}
+
+function verdictBadgeClass(verdict: OrgVerdict | undefined | null) {
+  if (verdict === "pass") return "org-pass";
+  if (verdict === "fail") return "org-fail";
+  if (verdict === "none") return "org-none";
+  return "org-pending";
+}
+
+interface ParsedReceipt {
+  round: number;
+  reviewedAt: string;
+  items: { blockId: string; verdict: string; note: string }[];
+}
+
+function parseReceiptData(data: unknown): ParsedReceipt | null {
+  if (typeof data !== "object" || data === null) return null;
+  const raw = data as Record<string, unknown>;
+  if (raw.schema !== RECEIPT_SCHEMA || !Array.isArray(raw.items)) return null;
+  const round = Number(raw.round) || 1;
+  const reviewedAt = typeof raw.reviewedAt === "string" ? raw.reviewedAt : new Date().toISOString();
+  const items: { blockId: string; verdict: string; note: string }[] = [];
+  for (const entry of raw.items) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const record = entry as Record<string, unknown>;
+    const blockId = typeof record.blockId === "string" ? record.blockId : "";
+    if (!blockId) continue;
+    items.push({
+      blockId,
+      verdict: typeof record.verdict === "string" ? record.verdict : "",
+      note: typeof record.note === "string" ? record.note : "",
+    });
+  }
+  return { round, reviewedAt, items };
+}
+
+function receiptCounts(receipt: ReviewReceipt | null) {
+  if (!receipt) return { pass: 0, fail: 0, none: 0, protected: 0, matched: 0, unmatched: 0 };
+  let pass = 0;
+  let fail = 0;
+  let none = 0;
+  let protectedCount = 0;
+  for (const item of receipt.items) {
+    if (item.verdict === "pass") pass += 1;
+    else if (item.verdict === "fail") fail += 1;
+    else if (item.verdict === "none") none += 1;
+    if (item.protected) protectedCount += 1;
+  }
+  const matched = receipt.items.filter((item) => item.matched).length;
+  return { pass, fail, none, protected: protectedCount, matched, unmatched: receipt.items.length - matched };
+}
+
+function transientSyncFail(blockId: string): boolean {
+  // 无后端环境下模拟机构回执同步：首次对账时部分条目会遇到可重试的同步中断。
+  let hash = 0;
+  for (const char of blockId) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  return hash % 3 === 0;
+}
+
+function reconcileItem(draft: ChapterProject, item: ReceiptItem, isRetry: boolean): { ok: boolean; error: string } {
+  const block = draft.blocks.find((candidate) => candidate.id === item.blockId);
+  if (!block) return { ok: false, error: "找不到对应缺陷条目（blockId 对不上）" };
+  if (item.verdict !== "pass" && item.verdict !== "fail" && item.verdict !== "none") {
+    return { ok: false, error: "回执结论格式无效" };
+  }
+  if (!isRetry && transientSyncFail(item.blockId)) {
+    return { ok: false, error: "回执同步中断，可重试补对" };
+  }
+  const hasReason = block.changeReason.trim().length > 0;
+  if (item.verdict === "none" && hasReason) {
+    // 编辑已写明改写原因、机构这轮没提异议：原因、批注和审核状态不跟着机构那份结论走。
+    item.protected = true;
+  } else if (item.verdict === "pass") {
+    // 机构刚判通过：工作台对应条目才转为已通过。
+    block.reviewStatus = "approved";
+    item.protected = false;
+  } else if (item.verdict === "fail") {
+    // 机构判为不通过：退回工作台重做。
+    block.reviewStatus = "needs-work";
+    item.protected = false;
+    if (item.note.trim()) {
+      block.comments.unshift({
+        id: uid("comment"),
+        author: "外部审校机构",
+        body: `退回重做：${item.note.trim()}`,
+        createdAt: new Date().toISOString(),
+        resolved: false,
+        replies: [],
+      });
+    }
+  } else {
+    // 机构本轮无异议且编辑未写原因：保持工作台原状态。
+    item.protected = false;
+  }
+  block.orgVerdict = item.verdict;
+  block.orgNote = item.note;
+  block.orgRound = draft.reviewReceipt?.round ?? 1;
+  return { ok: true, error: "" };
+}
+
+function runReconciliation(draft: ChapterProject, isRetry: boolean) {
+  const receipt = draft.reviewReceipt;
+  if (!receipt) return;
+  for (const item of receipt.items) {
+    if (item.matched) continue; // 只补还没对上的，已对上的不再重复处理
+    item.attempts += 1;
+    const result = reconcileItem(draft, item, isRetry);
+    if (result.ok) {
+      item.matched = true;
+      item.error = "";
+    } else {
+      item.matched = false;
+      item.error = result.error;
+    }
+  }
+}
+
+function importReceiptText(text: string): boolean {
+  const parsed = parseReceiptData(text);
+  if (!parsed) return false;
+  commit("导入机构回执", (draft) => {
+    draft.reviewReceipt = {
+      schema: RECEIPT_SCHEMA,
+      round: parsed.round,
+      reviewedAt: parsed.reviewedAt,
+      importedAt: new Date().toISOString(),
+      items: parsed.items.map((raw) => ({
+        blockId: raw.blockId,
+        verdict: (raw.verdict === "pass" || raw.verdict === "fail" || raw.verdict === "none" ? raw.verdict : "none") as OrgVerdict,
+        note: raw.note,
+        matched: false,
+        protected: false,
+        error: "",
+        attempts: 0,
+      })),
+    };
+    runReconciliation(draft, false);
+  });
+  // 导入成功即返回 true；部分条目未对上（如同步中断）属于可重试状态，不视为导入失败。
+  return true;
+}
+
+function retryUnmatched(blockId?: string) {
+  commit("重试机构对账", (draft) => {
+    const receipt = draft.reviewReceipt;
+    if (!receipt) return;
+    if (blockId) {
+      const item = receipt.items.find((candidate) => candidate.blockId === blockId);
+      if (item && !item.matched) {
+        item.attempts += 1;
+        const result = reconcileItem(draft, item, true);
+        if (result.ok) {
+          item.matched = true;
+          item.error = "";
+        } else {
+          item.matched = false;
+          item.error = result.error;
+        }
+      }
+      return;
+    }
+    runReconciliation(draft, true);
+  });
+}
+
+function buildExampleReceipt(): string {
+  const pattern: OrgVerdict[] = ["pass", "none", "pass", "fail", "none", "pass", "none", "fail"];
+  const notes: Record<OrgVerdict, string> = {
+    pass: "改写后表达清晰，通过复核。",
+    fail: "未说明关键信息或替代文本不到位，退回工作台重做。",
+    none: "编辑已写明改写原因，本轮无异议。",
+  };
+  const items = project.blocks.map((block, index) => {
+    const verdict = pattern[index % pattern.length];
+    return { blockId: block.id, verdict, note: notes[verdict] };
+  });
+  return JSON.stringify({
+    schema: RECEIPT_SCHEMA,
+    round: (project.reviewReceipt?.round ?? 0) + 1,
+    reviewedAt: new Date().toISOString(),
+    items,
+  }, null, 2);
+}
+
+function downloadReceiptTemplate() {
+  const round = (project.reviewReceipt?.round ?? 0) + 1;
+  download(`机构回执-示例-第${round}轮.json`, buildExampleReceipt(), "application/json;charset=utf-8");
 }
 
 function parseImportedChapter(input: string): ContentBlock[] {
@@ -339,6 +558,34 @@ function severityLabel(severity: Severity) {
   return "一致性提醒";
 }
 
+function exportReviewSection(project: ChapterProject): string {
+  const receipt = project.reviewReceipt;
+  if (!receipt) return "";
+  const counts = receiptCounts(receipt);
+  const rows = project.blocks.map((block, index) => {
+    const item = receipt.items.find((candidate) => candidate.blockId === block.id);
+    const verdict = item?.verdict ?? block.orgVerdict;
+    return `      <tr>
+        <td>${index + 1}</td>
+        <td>${escapeHtml(blockRole(block))}</td>
+        <td>${escapeHtml(block.accessibleText || block.text || "")}</td>
+        <td class="verdict-cell verdict-${verdict ?? "none"}">${verdictLabel(verdict)}</td>
+        <td>${item?.note ? escapeHtml(item.note) : ""}</td>
+      </tr>`;
+  }).join("\n");
+  return `
+    <section class="review-conclusions" aria-label="外部审校复核结论">
+      <h2>外部审校复核结论（第 ${receipt.round} 轮）</h2>
+      <p class="review-summary">工作台与机构回执已按缺陷条目对账：<b>通过 ${counts.pass}</b> · <b>不通过 ${counts.fail}</b> · 无异议 ${counts.none} · 已保护 ${counts.protected} · ${counts.unmatched ? `未对上 ${counts.unmatched}` : "全部对上"}。机构判为不通过的条目已退回工作台重做，机构判为通过的条目已转为已通过；编辑已写明改写原因且机构本轮无异议的条目，原因、批注与审核状态不随机构结论变动。</p>
+      <table>
+        <thead><tr><th scope="col">#</th><th scope="col">类型</th><th scope="col">条目</th><th scope="col">机构结论</th><th scope="col">机构说明</th></tr></thead>
+        <tbody>
+${rows}
+        </tbody>
+      </table>
+    </section>`;
+}
+
 function exportHtml(project: ChapterProject) {
   const body = project.blocks.map((block) => {
     if (block.type === "heading") {
@@ -367,12 +614,21 @@ function exportHtml(project: ChapterProject) {
     h1, h2, h3, h4, h5, h6 { line-height: 1.4; margin-top: 1.8em; }
     figure { margin: 2em 0; } img { max-width: 100%; height: auto; } figcaption { font-size: .86em; color: #46554f; }
     .skip { position: absolute; left: -9999px; } .skip:focus { position: static; display: inline-block; padding: .5em; background: #fff; }
+    .review-conclusions { margin-top: 3em; padding-top: 1.5em; border-top: 3px solid #1f4a3e; }
+    .review-conclusions h2 { font-size: 1.3em; color: #1f4a3e; }
+    .review-summary { font-size: .9em; color: #3c4a44; background: #f2f7f4; border-left: 4px solid #2f7a5c; padding: .8em 1em; border-radius: 6px; }
+    .review-conclusions table { width: 100%; border-collapse: collapse; margin-top: 1em; font-size: .85em; }
+    .review-conclusions th, .review-conclusions td { border: 1px solid #d5ddd9; padding: .55em .7em; text-align: left; vertical-align: top; }
+    .review-conclusions th { background: #eef3f0; color: #2f4a41; }
+    .verdict-cell { font-weight: 700; white-space: nowrap; }
+    .verdict-pass { color: #287a55; } .verdict-fail { color: #b9362d; } .verdict-none { color: #6b7671; }
   </style>
 </head>
 <body>
   <a class="skip" href="#main">跳到正文</a>
   <main id="main" tabindex="-1">
       ${body}
+      ${exportReviewSection(project)}
   </main>
 </body>
 </html>`;
@@ -391,7 +647,10 @@ function download(filename: string, content: string, type = "text/html;charset=u
 function loadProject(): ChapterProject {
   try {
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: ChapterProject };
-    if (stored.schema === 1 && stored.project?.blocks?.length) return stored.project;
+    if (stored.schema === 1 && stored.project?.blocks?.length) {
+      stored.project.reviewReceipt ??= null;
+      return stored.project;
+    }
   } catch {
     // Fall back to the bundled sample.
   }
@@ -408,6 +667,8 @@ let activeIssueId = "";
 let previewMode: "normal" | "assisted" = "normal";
 let selectedVersionId = "";
 let showGlossary = false;
+let showReceipt = false;
+let receiptError = "";
 let undoStack: ChapterProject[] = [];
 let redoStack: ChapterProject[] = [];
 let saveTimer = 0;
@@ -480,6 +741,7 @@ function render() {
           <sl-button size="small" variant="default" ${undoStack.length ? "" : "disabled"} data-action="undo">撤销</sl-button>
           <sl-button size="small" variant="default" ${redoStack.length ? "" : "disabled"} data-action="redo">重做</sl-button>
           <sl-button size="small" variant="default" data-action="glossary">术语表</sl-button>
+          <sl-button size="small" variant="${receiptCounts(project.reviewReceipt).unmatched ? "warning" : "default"}" data-action="receipt">机构对账${receiptCounts(project.reviewReceipt).unmatched ? ` · ${receiptCounts(project.reviewReceipt).unmatched} 未对上` : ""}</sl-button>
           <sl-button size="small" variant="primary" data-action="save-version">保存版本</sl-button>
           <sl-button size="small" variant="success" data-action="export">导出无障碍 HTML</sl-button>
         </div>
@@ -504,7 +766,7 @@ function render() {
               return `<button class="block-item ${block.id === active.id ? "active" : ""}" data-action="select-block" data-block-id="${block.id}">
                 <span class="block-order">${index + 1}</span>
                 <span class="block-copy"><b>${block.type === "heading" ? `H${block.headingLevel}` : blockRole(block)}</b><span>${escapeHtml(block.accessibleText || block.text || "（空）")}</span></span>
-                <i class="status-${block.reviewStatus}" title="${statusLabel(block.reviewStatus)}"></i>
+                <span class="block-badges"><i class="status-${block.reviewStatus}" title="${statusLabel(block.reviewStatus)}"></i><i class="org-dot ${verdictBadgeClass(block.orgVerdict)}" title="${verdictLabel(block.orgVerdict)}"></i></span>
                 ${blockIssues.length ? `<em>${blockIssues.length}</em>` : ""}
               </button>`;
             }).join("")}
@@ -518,6 +780,7 @@ function render() {
           <div class="editor-head">
             <div><span class="eyebrow">当前内容块</span><h1>${blockRole(active)}</h1></div>
             <div class="review-actions">
+              <span class="org-badge ${verdictBadgeClass(active.orgVerdict)}">机构结论：${verdictLabel(active.orgVerdict)}${active.orgRound ? ` · 第${active.orgRound}轮` : ""}</span>
               <sl-button size="small" variant="${active.reviewStatus === "approved" ? "success" : "default"}" data-action="approve">${active.reviewStatus === "approved" ? "✓ 已通过" : "审核通过"}</sl-button>
               <sl-button size="small" variant="${active.reviewStatus === "needs-work" ? "danger" : "default"}" data-action="needs-work">需修改</sl-button>
             </div>
@@ -598,6 +861,11 @@ function render() {
       </div>
       <div class="term-add"><sl-input id="new-term-source" placeholder="原文术语"></sl-input><sl-input id="new-term-preferred" placeholder="统一表达"></sl-input><sl-button variant="primary" data-action="add-term">添加术语</sl-button></div>
       <sl-button slot="footer" variant="primary" data-action="close-glossary">完成</sl-button>
+    </sl-dialog>
+
+    <sl-dialog label="外部审校回执对账" ${showReceipt ? "open" : ""} data-dialog="receipt" class="receipt-dialog">
+      ${renderReceiptDialog()}
+      <sl-button slot="footer" variant="default" data-action="close-receipt">关闭</sl-button>
     </sl-dialog>`;
 
   wireLiveFields();
@@ -646,6 +914,54 @@ function renderVersionDiff(version: VersionSnapshot, current: ContentBlock) {
   const oldBlock = version.blocks.find((block) => block.id === current.id);
   if (!oldBlock) return `<div class="empty-note">当前内容块不在该版本中。</div>`;
   return `<div class="diff-column"><span>旧版</span><p>${escapeHtml(oldBlock.accessibleText || oldBlock.text)}</p></div><div class="diff-column current"><span>当前</span><p>${escapeHtml(current.accessibleText || current.text)}</p></div>`;
+}
+
+function renderReceiptDialog() {
+  const receipt = project.reviewReceipt;
+  const counts = receiptCounts(receipt);
+  return `
+    <div class="receipt-body">
+      ${receiptError ? `<div class="receipt-error">${escapeHtml(receiptError)}</div>` : ""}
+      <div class="receipt-actions">
+        <input id="receipt-file" type="file" accept=".json,application/json" hidden />
+        <sl-button size="small" variant="primary" data-action="import-receipt">导入机构回执</sl-button>
+        <sl-button size="small" variant="default" data-action="download-receipt-template">下载示例回执</sl-button>
+        ${counts.unmatched ? `<sl-button size="small" variant="warning" data-action="retry-unmatched">重试未对上条目（${counts.unmatched}）</sl-button>` : ""}
+      </div>
+      <p class="receipt-hint">工作台与机构回执各留一份，按缺陷条目对账：机构判为不通过的退回工作台重做，机构刚判通过的转为已通过；已写明改写原因且机构本轮无异议的条目，原因、批注与审核状态不随机构结论变动。</p>
+      ${receipt ? `
+        <div class="receipt-summary">
+          <span class="receipt-round">第 <b>${receipt.round}</b> 轮</span>
+          <span class="org-pass">通过 ${counts.pass}</span>
+          <span class="org-fail">不通过 ${counts.fail}</span>
+          <span class="org-none">无异议 ${counts.none}</span>
+          <span class="org-protected">已保护 ${counts.protected}</span>
+          <span class="${counts.unmatched ? "org-unmatched" : "org-matched"}">${counts.unmatched ? `未对上 ${counts.unmatched}` : "全部对上"}</span>
+        </div>
+        <div class="receipt-table">
+          ${receipt.items.map((item) => {
+            const block = project.blocks.find((candidate) => candidate.id === item.blockId);
+            const index = project.blocks.findIndex((candidate) => candidate.id === item.blockId);
+            return `<div class="receipt-row ${item.matched ? "matched" : "unmatched"} ${item.protected ? "protected" : ""}">
+              <div class="receipt-row-main">
+                <span class="receipt-idx">${index >= 0 ? index + 1 : "?"}</span>
+                <div class="receipt-row-text">
+                  <b>${block ? escapeHtml(blockRole(block)) : "（条目不存在）"}</b>
+                  <span>${block ? escapeHtml(block.accessibleText || block.text || "（空）") : `blockId：${escapeHtml(item.blockId)}`}</span>
+                </div>
+              </div>
+              <div class="receipt-row-status">
+                <span class="workbench-status status-${block?.reviewStatus ?? "pending"}">工作台：${block ? statusLabel(block.reviewStatus) : "—"}</span>
+                <span class="org-verdict verdict-${item.verdict}">${verdictLabel(item.verdict)}</span>
+                ${item.protected ? `<span class="protected-tag">已保护</span>` : ""}
+              </div>
+              ${item.note ? `<div class="receipt-row-note">${escapeHtml(item.note)}</div>` : ""}
+              ${!item.matched ? `<div class="receipt-row-error"><span>${escapeHtml(item.error || "未对上")}${item.attempts > 1 ? `（已试 ${item.attempts} 次）` : ""}</span><sl-button size="small" variant="text" data-action="retry-item" data-block-id="${item.blockId}">重试</sl-button></div>` : ""}
+            </div>`;
+          }).join("")}
+        </div>
+      ` : `<div class="empty-note">尚未导入机构回执。可下载示例回执后导入，按缺陷条目对账。</div>`}
+    </div>`;
 }
 
 function wireLiveFields() {
@@ -729,6 +1045,15 @@ app.addEventListener("click", (event) => {
   if (action === "preview-assisted") { previewMode = "assisted"; render(); }
   if (action === "glossary") { showGlossary = true; render(); }
   if (action === "close-glossary") { showGlossary = false; render(); }
+  if (action === "receipt") { showReceipt = true; receiptError = ""; render(); }
+  if (action === "close-receipt") { showReceipt = false; render(); }
+  if (action === "import-receipt") {
+    receiptError = "";
+    app.querySelector<HTMLInputElement>("#receipt-file")?.click();
+  }
+  if (action === "download-receipt-template") downloadReceiptTemplate();
+  if (action === "retry-unmatched") { retryUnmatched(); render(); }
+  if (action === "retry-item") { retryUnmatched(target.dataset.blockId); render(); }
   if (action === "add-term") {
     const source = app.querySelector<HTMLElement & { value: string }>("#new-term-source");
     const preferred = app.querySelector<HTMLElement & { value: string }>("#new-term-preferred");
@@ -780,6 +1105,16 @@ app.addEventListener("sl-change", (event) => {
 
 app.addEventListener("change", (event) => {
   const input = event.target as HTMLInputElement;
+  if (input.id === "receipt-file" && input.files?.[0]) {
+    const file = input.files[0];
+    void file.text().then((text) => {
+      const ok = importReceiptText(text);
+      receiptError = ok ? "" : "回执无法识别：请确认是本工作台导出的机构回执 JSON（schema 为 accessibility-review-receipt-v1）。";
+      input.value = "";
+      render();
+    });
+    return;
+  }
   if (input.id !== "chapter-file" || !input.files?.[0]) return;
   void input.files[0].text().then((text) => {
     commit("导入章节文本", (draft) => {
